@@ -9,7 +9,6 @@ from threading import Thread
 from tqdm import tqdm
 import argparse
 import subprocess
-import zstandard as zstd
 
 from github_utils.utils import GitRepo
 from github_utils.comments import aggregate_comments
@@ -63,6 +62,7 @@ class CommentWorker(Worker):
         return input
 
 class FileWorker(Worker):
+
     def compute_result(self, repo_data):
         args = self.args
         assert args.scratch_dir is not None
@@ -119,10 +119,16 @@ class FileWorker(Worker):
                 try:
                     for path in paths:
                         # dict with keys {'path', 'parent_content', 'parent_commit', 'child_content', 'child_commit'}
-                        file_datum = git_repo.get_file_before_and_after_commit(commit_id, path)
+                        file_content = git_repo.get_file_at_commit(commit_id, path)
+                        file_datum = {
+                            'commit_id': commit_id,
+                            'path': path,
+                            'content': file_content
+                        }
                         file_data.append(file_datum)
                     commit_info.append(git_repo.get_commit_info(commit_id, paths))
-                except:
+                except Exception as e:
+                    print(e)
                     bad_commits.add(commit_id)
             
             repo_data['file_data'] = file_data
@@ -135,6 +141,7 @@ class FileWorker(Worker):
             out_dir = os.path.join(args.output_dir, "data", username)
             os.makedirs(out_dir, exist_ok=True)
 
+            import zstandard as zstd
             comp = zstd.ZstdCompressor(level=3, threads=4)
             with open(os.path.join(out_dir, f"{projectname}.json.zstd"), 'wb') as f:
                 writer = comp.stream_writer(f)
@@ -157,6 +164,11 @@ class FileWorker(Worker):
         return (name, True, None)
 
 
+class FileDiffWorker(FileWorker):
+    def get_file_datum(commit_id, path):
+        return git_repo.get_file_before_and_after_commit(commit_id, path)
+
+
 def process_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('output_dir')
@@ -174,6 +186,26 @@ def process_args():
     parser.add_argument('--abort_on_errors', action='store_true')
     parser.add_argument('--retry_failures', action='store_true')
     return parser.parse_args()
+
+class Pipe:
+    def __init__(self, args, WorkerClass, num_workers, in_queue=None, out_queue=None, **worker_kwargs):
+        self.args = args
+        if in_queue is None:
+            in_queue = JoinableQueue()
+        if out_queue is None:
+            out_queue = JoinableQueue()
+        self.in_queue, self.out_queue = in_queue, out_queue
+        self.workers = []
+        self.num_workers = num_workers
+        self.WorkerClass = WorkerClass
+        self.worker_kwargs = worker_kwargs
+
+    def start(self, pbar_total=None, pbar_name='', pbar_position=None):
+        progress_bar = tqdm(total=pbar_total, ncols=120, desc=f"{pbar_name} worker", position=pbar_position)
+        for i in range(self.num_workers):
+            worker = self.WorkerClass(self.args, i, self.in_queue, self.out_queue, progress_bar=progress_bar, **self.worker_kwargs)
+            worker.start()
+            self.workers.append(worker)
 
 
 if __name__ == '__main__':
@@ -247,31 +279,12 @@ if __name__ == '__main__':
     random.seed(1)
     random.shuffle(all_repo_data)
 
-    class Pipe:
-        def __init__(self, WorkerClass, num_workers, in_queue=None, out_queue=None, **worker_kwargs):
-            if in_queue is None:
-                in_queue = JoinableQueue()
-            if out_queue is None:
-                out_queue = JoinableQueue()
-            self.in_queue, self.out_queue = in_queue, out_queue
-            self.workers = []
-            self.num_workers = num_workers
-            self.WorkerClass = WorkerClass
-            self.worker_kwargs = worker_kwargs
-
-        def start(self, pbar_total=None, pbar_name='', pbar_position=None):
-            progress_bar = tqdm(total=pbar_total, ncols=120, desc=f"{pbar_name} worker", position=pbar_position)
-            for i in range(self.num_workers):
-                worker = self.WorkerClass(args, i, self.in_queue, self.out_queue, progress_bar=progress_bar, **self.worker_kwargs)
-                worker.start()
-                self.workers.append(worker)
-
 
     os.makedirs(scratch_dir, exist_ok=True)
     os.chdir(scratch_dir)
 
-    comment_pipe = Pipe(CommentWorker, args.num_threads)
-    file_pipe = Pipe(FileWorker, args.num_threads, in_queue=comment_pipe.out_queue)
+    comment_pipe = Pipe(args, CommentWorker, args.num_threads)
+    file_pipe = Pipe(args, FileDiffWorker, args.num_threads, in_queue=comment_pipe.out_queue)
 
     num_jobs = len(all_repo_data)
 
