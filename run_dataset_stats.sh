@@ -1,5 +1,12 @@
 #!/bin/bash
 
+#SBATCH --time=4320
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=40
+#SBATCH --partition=devlab
+#SBATCH --mem-per-cpu=2G
+
 #data_dir=$1
 # source=$2
 
@@ -23,9 +30,9 @@
 for data_dir in $@
 do
   python -u dataset_stats_par.py $data_dir \
-    --tokenizer_names bpe bpe_psno-False bpe_psno-True \
+    --tokenizer_names gpt2 codet5 ours \
     --n_procs 40 \
-    | tee ${data_dir}/size_stats_jupyter_proc_2.out
+    | tee ${data_dir}/size_stats_jupyter_proc.out
 done
 
   #--source $source \

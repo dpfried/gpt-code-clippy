@@ -29,6 +29,8 @@ from code_clippy_dataset.utils import infer_setlanguage_from_data_dir, infer_sou
 
 from to_fairseq.gpt2_bpe_utils import get_encoder
 
+from to_fairseq.patch_pickle import patch_mp_connection_bpo_17560
+
 STAR_THRESHOLDS = {
     ('github', 'javascript'): [2, 5, 15, 41, 102, 239],
     ('github', 'python'):     [0, 2, 8, 24, 66, 161],
@@ -73,6 +75,19 @@ def main():
         help='use huggingface tokenizer. faster than python implementation'
     )
     parser.add_argument(
+        "--maxlen-tokenizer-merge-file",
+        help="path to merges.txt",
+    )
+    parser.add_argument(
+        "--maxlen-tokenizer-vocab-file",
+        type=str,
+        help="path to vocab.txt",
+    )
+    parser.add_argument(
+        "--maxlen-tokens",
+        type=int,
+    )
+    parser.add_argument(
         "--input-dirs",
         required=True,
         nargs="+",
@@ -113,8 +128,19 @@ def main():
         action='store_true',
     )
 
+    parser.add_argument(
+        '--bpe-dropout',
+        type=float,
+    )
+
     parser.add_argument("--workers", type=int, default=20)
+
+    parser.add_argument("--file-extension-keep", nargs="*", help="keep only files ending in these extensions")
+    parser.add_argument("--file-extension-exclude", nargs="*", help="exclude any files ending in these extensions")
     args = parser.parse_args()
+
+
+    patch_mp_connection_bpo_17560()
 
     def read_project_names(split):
         with open(os.path.join(args.splits_dir, split), 'r') as f:
@@ -138,6 +164,8 @@ def main():
                     f.write('\n\n')
         return shard_num + 1
 
+    datasets.set_caching_enabled(False)
+
     for input_dir in args.input_dirs:
         data = datasets.load_from_disk(input_dir)
 
@@ -149,8 +177,37 @@ def main():
         data = data.add_column('dataset_dir', np.full(len(data), input_dir))
         data_augmented = data.map(encoder.process, num_proc=args.workers)
 
-        train_data = data_augmented.filter(lambda record: record['split'] == 'train', num_proc=args.workers)
-        val_data = data_augmented.filter(lambda record: record['split'] == 'val', num_proc=args.workers)
+        if args.file_extension_keep is not None:
+            assert args.file_extension_exclude is None, "can't pass both --file-extension-keep and --file-extension-exclude"
+            assert all(ext.startswith(".") for ext in args.file_extension_keep)
+            file_extension_keep = set(args.file_extension_keep)
+            print(f"filtering to only include extensions {' '.join(sorted(file_extension_keep))}")
+        else:
+            file_extension_keep = None
+
+        if args.file_extension_exclude is not None:
+            assert args.file_extension_keep is None, "can't pass both --file-extension-keep and --file-extension-exclude"
+            assert all(ext.startswith(".") for ext in args.file_extension_exclude)
+            file_extension_exclude = set(args.file_extension_exclude)
+            print(f"filtering to exclude any files with extensions in {' '.join(sorted(file_extension_exclude))}")
+        else:
+            file_extension_exclude = None
+
+        def filter_function(split):
+            def fn(record):
+                if file_extension_keep is not None or file_extension_exclude is not None:
+                    extension = os.path.splitext(record['file_name'])[1]
+                    if file_extension_keep is not None and extension not in file_extension_keep:
+                        return False
+                    if file_extension_exclude is not None and extension in file_extension_exclude:
+                        return False
+                if record['over_max_length']:
+                    return False
+                return record['split'] == split
+            return fn
+
+        train_data = data_augmented.filter(filter_function('train'), num_proc=args.workers)
+        val_data = data_augmented.filter(filter_function('val'), num_proc=args.workers)
 
         print(f"{dataset_name}: filtered")
         train_raw_shards = save_to_shards(train_data['augmented_text'], dataset_name, 'train', 'raw')
@@ -214,15 +271,29 @@ class MultiprocessingEncoder(object):
         # self.bpes = [self._make_bpe() for _ in range(self.args.workers)]
         self.train_project_names = train_project_names
         self.val_project_names = val_project_names
+        if self.args.maxlen_tokens is not None:
+            assert self.args.use_hf_tokenizer
+            # TODO: maybe make this explicitly multiprocess as well, or maybe it's fine because of forks
+            from tokenizers import ByteLevelBPETokenizer
+            self.maxlen_bpe = ByteLevelBPETokenizer.from_file(
+                self.args.maxlen_tokenizer_vocab_file, self.args.maxlen_tokenizer_merge_file,
+                pretokenizer_split_newlines_only=False,
+                )
+        else:
+            self.maxlen_bpe = None
 
     def _make_bpe(self):
         if self.args.use_hf_tokenizer:
             from tokenizers import ByteLevelBPETokenizer
+            if self.args.bpe_dropout:
+                print(f"dropout: {self.args.bpe_dropout}")
             bpe = ByteLevelBPETokenizer.from_file(
                 self.args.vocab_file, self.args.merge_file,
                 pretokenizer_split_newlines_only=self.args.pretokenizer_split_newlines_only,
+                dropout=self.args.bpe_dropout,
                 )
         else:
+            assert self.args.bpe_dropout == None
             pretokenizer_split = "newlines_only" if self.args.pretokenizer_split_newlines_only else "default"
             bpe = get_encoder(self.args.vocab_file, self.args.merge_file, pretokenizer_split)
         return bpe
@@ -288,11 +359,19 @@ class MultiprocessingEncoder(object):
         augmented_file = make_tagged('file', text, attributes=attributes, insert_newlines=True, attribute_move_probability=self.args.attribute_move_probability)
         # encoded = self.encode_text(rank, augmented_file)
 
-        return {
+        d = {
             'augmented_text': augmented_file,
             # 'augmented_text_tokens': encoded,
             'split': split
         }
+
+        if self.args.maxlen_tokens is not None:
+            ids = self.maxlen_bpe.encode(text).ids
+            d['over_max_length'] = len(ids) > self.args.maxlen_tokens
+        else:
+            d['over_max_length'] = False
+
+        return d
 
     def initializer(self):
         global bpe

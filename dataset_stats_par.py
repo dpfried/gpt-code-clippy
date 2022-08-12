@@ -14,7 +14,7 @@ import humanize
 import numpy as np
 
 from datasets import load_dataset, load_from_disk
-from transformers import GPT2TokenizerFast, PreTrainedTokenizerFast
+#from transformers import GPT2TokenizerFast, PreTrainedTokenizerFast
 from tokenizers import ByteLevelBPETokenizer
 
 import sentencepiece
@@ -30,7 +30,7 @@ ADD_PREFIX_SPACE = False
 #LANGUAGE_SOURCES = ['repo_language', 'filename_extension', 'linguist']
 LANGUAGE_SOURCES = ['linguist']
 
-POSSIBLE_TOKENIZERS = ["gpt2", "codet5", "bpe", "bpe_psno-False", "bpe_psno-True", "bpe_rn", "sentencepiece", "sentencepiece_rn"]
+POSSIBLE_TOKENIZERS = ["gpt2", "codet5", "ours", "sentencepiece", "sentencepiece_rn"]
 
 from train_multicorp_tokenizer import NEWLINE_REP
 
@@ -55,7 +55,11 @@ class Worker(Process):
         # guess = None
         tokenizers = {}
         if "gpt2" in self.tokenizer_names:
-            tokenizers["gpt2"] = GPT2TokenizerFast.from_pretrained("gpt2", add_prefix_space=ADD_PREFIX_SPACE)
+            #tokenizers["gpt2"] = GPT2TokenizerFast.from_pretrained("gpt2", add_prefix_space=ADD_PREFIX_SPACE)
+            tokenizers["gpt2"] = ByteLevelBPETokenizer.from_file(
+                "/private/home/halilakin/src/gpt2_bpe/encoder.json",
+                "/private/home/halilakin/src/gpt2_bpe/vocab.bpe",
+            )
         if "codet5" in self.tokenizer_names:
             codet5_tokenizer_model = ByteLevelBPETokenizer.from_file(
                 "../CodeT5/tokenizer/salesforce/codet5-vocab.json",
@@ -68,38 +72,15 @@ class Worker(Process):
                     "<unk>",
                     "<mask>"
             ])
-            tokenizers["codet5"] = PreTrainedTokenizerFast(tokenizer_object=codet5_tokenizer_model)
-        if "bpe" in self.tokenizer_names:
+            tokenizers["codet5"] = codet5_tokenizer_model
+            #tokenizers["codet5"] = PreTrainedTokenizerFast(tokenizer_object=codet5_tokenizer_model)
+        if "ours" in self.tokenizer_names:
             our_tokenizer_model = ByteLevelBPETokenizer.from_file(
-                "tokenizers/github-py+so_bpe_rn-False/vocab.json",
-                "tokenizers/github-py+so_bpe_rn-False/merges.txt",
+                "/checkpoint/dpf/data/tokenizers/github-py-redacted+so_psno-True/vocab.json",
+                "/checkpoint/dpf/data/tokenizers/github-py-redacted+so_psno-True/merges.txt",
                 pretokenizer_split_newlines_only=True,
             )
-            tokenizers["bpe"] = PreTrainedTokenizerFast(tokenizer_object=our_tokenizer_model)
-        if "bpe_psno-False" in self.tokenizer_names:
-            our_tokenizer_model = ByteLevelBPETokenizer.from_file(
-                "tokenizers/github-py+so_psno-False/vocab.json",
-                "tokenizers/github-py+so_psno-False/merges.txt",
-                pretokenizer_split_newlines_only=False,
-            )
-            tokenizers["bpe_psno-False"] = PreTrainedTokenizerFast(tokenizer_object=our_tokenizer_model)
-        if "bpe_psno-True" in self.tokenizer_names:
-            our_tokenizer_model = ByteLevelBPETokenizer.from_file(
-                "tokenizers/github-py+so_psno-True/vocab.json",
-                "tokenizers/github-py+so_psno-True/merges.txt",
-                pretokenizer_split_newlines_only=True,
-            )
-            tokenizers["bpe_psno-True"] = PreTrainedTokenizerFast(tokenizer_object=our_tokenizer_model)
-        if "bpe_rn" in self.tokenizer_names:
-            our_tokenizer_model_rn = ByteLevelBPETokenizer.from_file(
-                "tokenizers/github-py+so_bpe_rn-True/vocab.json",
-                "tokenizers/github-py+so_bpe_rn-True/merges.txt",
-            )
-            our_tokenizer_rn = PreTrainedTokenizerFast(tokenizer_object=our_tokenizer_model_rn)
-            def bpe_rn_tokenize(text):
-                text = text.replace("\n", NEWLINE_REP)
-                return our_tokenizer_rn(text)
-            tokenizers["bpe_rn"] = bpe_rn_tokenize
+            tokenizers["ours"] = our_tokenizer_model
         if "sentencepiece" in self.tokenizer_names:
             sp_tokenizer = sentencepiece.SentencePieceProcessor()
             SPLIT_LINES = re.compile(f'.*[\r\n]+')
@@ -162,7 +143,7 @@ class Worker(Process):
         d['file_size'] = len(x['text'])
 
         for tokenizer_name, tokenizer in tokenizers.items():
-            tokens = tokenizer(x['text'])['input_ids']
+            tokens = tokenizer.encode(x['text']).ids
             token_count = len(tokens)
             d[f'{tokenizer_name}_token_count'] = token_count
             # d[f'{tokenizer_name}_above_1024'] = 1.0 if token_count > 1024 else 0.0
@@ -302,6 +283,7 @@ def tabulate(data, tokenizer_names, n_procs=10, max_items=None):
             out_queue.task_done()
             file_count += 1
             if file_count % 100000 == 0:
+            #if file_count % 100 == 0:
                 print(f"total files: {file_count}")
                 display_counts(file_counts, tabulated, sum_stats, mean_stats)
                 print()

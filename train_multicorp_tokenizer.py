@@ -19,7 +19,7 @@ NEWLINE_REP = "<|n|>"
 
 SPLIT_LINES = re.compile(f'.*[\r\n]+')
 
-from code_bpe_encoder import redact_pii
+from to_fairseq.code_bpe_encoder import redact_pii
 
 def make_iter(filename):
     if filename.endswith('csv'):
